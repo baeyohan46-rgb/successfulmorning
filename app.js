@@ -5,12 +5,13 @@ import {
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
   getFirestore, doc, getDoc, getDocs, setDoc, updateDoc, collection, query, where,
-  onSnapshot, serverTimestamp
+  onSnapshot, serverTimestamp, writeBatch
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 
 /* ================= 기본 설정 ================= */
 const WINDOW_BEFORE = 90;   // 목표 90분 전부터 인증 가능 (firestore.rules와 같아야 함)
-const WINDOW_AFTER = 30;    // 목표 30분 후까지 인증 가능 (지각으로 기록)
+const WINDOW_AFTER = 10;    // 목표 10분 후까지 인증 가능 (지각으로 기록)
+const PHOTO_MAX = 720;      // 인증 사진 긴 변 최대 픽셀 (작게 줄여서 무료 한도 안에서 저장)
 const GOAL_MIN = 240, GOAL_MAX = 660; // 04:00 ~ 11:00
 const WEEKDAYS = ['일', '월', '화', '수', '목', '금', '토'];
 
@@ -24,6 +25,8 @@ const P = {
   sun: '<circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path>',
   check: '<path d="M5 12.5l4.5 4.5L19 7.5"></path>',
   clock: '<circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path>',
+  camera: '<path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"></path><circle cx="12" cy="13.5" r="3.5"></circle>',
+  x: '<path d="M6 6l12 12M18 6L6 18"></path>',
   chart: '<path d="M6 20V10M12 20V4M18 20v-7"></path>',
   trophy: '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0V4z"></path><path d="M7 6H4v1a3 3 0 0 0 3 3M17 6h3v1a3 3 0 0 1-3 3"></path>',
   user: '<circle cx="12" cy="8" r="4"></circle><path d="M4 21a8 8 0 0 1 16 0"></path>',
@@ -68,12 +71,16 @@ const S = {
   mine: [],             // 내 모든 인증
   prev: [],             // 지난달 모든 사람의 인증
   prize: '', prevPrize: '',
+  photos: [],           // 오늘 모든 사람의 인증 사진
+  preview: null,        // 찍은 사진 미리보기 (dataURL)
+  viewPhoto: null,      // 크게 보는 사진
   tab: 'today',
   busy: false,
   loadError: false
 };
 let unsubs = [];
 let ym0 = ymOf(kst());
+let day0 = keyOf(kst());
 
 /* ================= Firebase ================= */
 let auth, db;
@@ -99,6 +106,7 @@ const onErr = (e) => { console.error(e); S.loadError = true; render(); };
 
 function startListening(uid) {
   ym0 = ymOf(kst());
+  day0 = keyOf(kst());
   const loadTimer = setTimeout(() => { if (S.profile === undefined) { S.loadError = true; render(); } }, 10000);
 
   unsubs.push(onSnapshot(doc(db, 'users', uid), (snap) => {
@@ -122,6 +130,10 @@ function startListening(uid) {
     S.mine = rows(snap); render();
   }, onErr));
 
+  unsubs.push(onSnapshot(query(collection(db, 'photos'), where('day', '==', day0)), (snap) => {
+    S.photos = rows(snap); render();
+  }, onErr));
+
   unsubs.push(onSnapshot(doc(db, 'prizes', String(ym0)), (snap) => {
     S.prize = snap.exists() ? (snap.data().text || '') : ''; render();
   }, onErr));
@@ -138,7 +150,7 @@ function startListening(uid) {
 function stopListening() {
   unsubs.forEach((u) => u());
   unsubs = [];
-  Object.assign(S, { users: {}, month: [], mine: [], prev: [], prize: '', prevPrize: '', isAdmin: false, loadError: false });
+  Object.assign(S, { users: {}, month: [], mine: [], prev: [], photos: [], prize: '', prevPrize: '', isAdmin: false, loadError: false });
 }
 
 /* ================= 계산 ================= */
@@ -183,7 +195,7 @@ function streakOf(mine, todayKey) {
 function render() {
   // 입력 중이면 다시 그리지 않음 (타이핑 방해 방지)
   const a = document.activeElement;
-  if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA') && $app.contains(a)) return;
+  if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA') && a.type !== 'file' && $app.contains(a)) return;
 
   if (configMissing) return void ($app.innerHTML = viewSetup());
   if (!S.authReady) return void ($app.innerHTML = '<div class="boot">불러오는 중…</div>');
@@ -196,7 +208,7 @@ function render() {
   if (S.profile === null) return void ($app.innerHTML = viewJoin());
 
   const body = { today: viewToday, rank: viewRank, king: viewKing, settings: viewSettings }[S.tab]();
-  $app.innerHTML = viewHeader() + `<main class="page">${body}</main>`;
+  $app.innerHTML = viewHeader() + `<main class="page">${body}</main>` + viewPhotoOverlay();
 }
 
 function viewSetup() {
@@ -268,13 +280,26 @@ function viewToday() {
   let action;
   if (mineToday) {
     const st = statusOf(mineToday);
+    const myPhoto = S.photos.find((ph) => ph.uid === S.user.uid);
+    const thumb = myPhoto ? `<button class="thumb" data-action="view-photo" data-id="${esc(myPhoto.id)}" aria-label="내 인증 사진 크게 보기"><img src="${esc(myPhoto.img)}" alt=""></button>` : '';
     action = st.late
-      ? `<div class="status" role="status"><div class="dot late">${svg(P.clock, 22, '#9A3412', 2.6)}</div><div><strong>${fmt(st.minutes)} 기상 인증 완료</strong><span>목표보다 ${-st.diff}분 늦어서 지각으로 기록됐어요</span></div></div>`
-      : `<div class="status" role="status"><div class="dot">${svg(P.check, 22, '#1D1B2E', 3)}</div><div><strong>${fmt(st.minutes)} 기상 인증 완료!</strong><span>${st.diff > 0 ? `목표보다 ${st.diff}분 일찍` : '목표 시간 딱 맞춰'} · ${streak}일 연속 성공 중</span></div></div>`;
+      ? `<div class="status" role="status">${thumb || `<div class="dot late">${svg(P.clock, 22, '#9A3412', 2.6)}</div>`}<div><strong>${fmt(st.minutes)} 기상 인증 완료</strong><span>목표보다 ${-st.diff}분 늦어서 지각으로 기록됐어요</span></div></div>`
+      : `<div class="status" role="status">${thumb || `<div class="dot">${svg(P.check, 22, '#1D1B2E', 3)}</div>`}<div><strong>${fmt(st.minutes)} 기상 인증 완료!</strong><span>${st.diff > 0 ? `목표보다 ${st.diff}분 일찍` : '목표 시간 딱 맞춰'} · ${streak}일 연속 성공 중</span></div></div>`;
   } else if (nowMin < goal - WINDOW_BEFORE) {
     action = `<div class="status"><div class="dot wait">${svg(P.clock, 22, '#FFB08F', 2.4)}</div><div><strong>${fmt(goal - WINDOW_BEFORE)}부터 인증할 수 있어요</strong><span>푹 자고 일어나서 만나요</span></div></div>`;
   } else if (nowMin <= goal + WINDOW_AFTER) {
-    action = `<button class="btn-sun" data-action="checkin" ${S.busy ? 'disabled' : ''}>${svg(P.sun, 22, 'currentColor', 2.4)} 지금 일어났어요</button>`;
+    action = S.preview
+      ? `<div class="preview">
+          <img src="${S.preview}" alt="찍은 인증 사진 미리보기">
+          <div class="preview-actions">
+            <button class="btn-sun" data-action="confirm-checkin" ${S.busy ? 'disabled' : ''}>${svg(P.check, 22, 'currentColor', 2.6)} ${S.busy ? '올리는 중…' : '이 사진으로 인증하기'}</button>
+            <label class="btn-retake" for="cam">다시 찍기</label>
+          </div>
+        </div>
+        <input id="cam" class="sr-only" type="file" accept="image/*" capture="environment" data-action-change="photo">`
+      : `<label class="btn-sun" for="cam" role="button" tabindex="0">${svg(P.camera, 22, 'currentColor', 2.2)} 물 뜨는 사진 찍고 인증하기</label>
+        <input id="cam" class="sr-only" type="file" accept="image/*" capture="environment" data-action-change="photo">
+        <span class="hero-hint">일어나서 물 한 잔 뜨는 모습을 찍어 주세요 · ${fmt(goal + WINDOW_AFTER)}까지</span>`;
   } else {
     action = `<div class="status"><div class="dot wait">${svg(P.clock, 22, '#FFB08F', 2.4)}</div><div><strong>오늘 인증 시간이 지났어요</strong><span>내일은 ${fmt(goal)}에 만나요!</span></div></div>`;
   }
@@ -297,6 +322,7 @@ function viewToday() {
       <div class="stat"><div class="label">현재 순위</div><div class="value"><b>${myRank ? myRank.rank : '-'}</b><span style="font-weight:700">위</span><span class="muted">/ ${rank.length}명</span></div></div>
     </div>
   </section>
+  ${viewFeed()}
   <section class="row">
     <div class="card grow">${viewCalendar(now)}</div>
     <div class="card side">
@@ -305,6 +331,40 @@ function viewToday() {
     </div>
   </section>
   ${viewReward(now)}`;
+}
+
+function viewFeed() {
+  const items = S.photos
+    .filter((ph) => S.users[ph.uid])
+    .map((ph) => {
+      const c = S.month.find((x) => x.uid === ph.uid && x.day === ph.day);
+      const st = c ? statusOf(c) : null;
+      return { ...ph, name: S.users[ph.uid].nickname, minutes: st ? st.minutes : 9999, late: st ? st.late : false };
+    })
+    .sort((a, b) => a.minutes - b.minutes);
+  return `<section class="card">
+    <div class="card-head"><h2>오늘의 기상 인증</h2><span class="chip">${items.length}명 인증</span></div>
+    ${items.length ? `<div class="feed">${items.map((it) => `
+      <button class="feed-item" data-action="view-photo" data-id="${esc(it.id)}" aria-label="${esc(it.name)}님 인증 사진 크게 보기">
+        <img src="${esc(it.img)}" alt="" loading="lazy">
+        <span class="feed-cap"><b>${esc(it.name)}</b><span class="num">${it.minutes < 9999 ? fmt(it.minutes) : ''}${it.late ? ' · 지각' : ''}</span></span>
+      </button>`).join('')}</div>`
+      : '<p class="empty">아직 오늘 인증한 사람이 없어요. 첫 번째로 일어나 보세요!</p>'}
+  </section>`;
+}
+
+function viewPhotoOverlay() {
+  if (!S.viewPhoto) return '';
+  const ph = S.photos.find((x) => x.id === S.viewPhoto);
+  if (!ph) return '';
+  const name = S.users[ph.uid] ? S.users[ph.uid].nickname : '';
+  return `<div class="overlay" data-action="close-photo">
+    <figure class="overlay-box">
+      <img src="${esc(ph.img)}" alt="${esc(name)}님의 오늘 인증 사진">
+      <figcaption>${esc(name)}님의 오늘 인증</figcaption>
+    </figure>
+    <button class="overlay-close" data-action="close-photo" aria-label="닫기">${svg(P.x, 24, '#FFF8F1', 2.4)}</button>
+  </div>`;
 }
 
 function viewCalendar(now) {
@@ -465,18 +525,76 @@ document.addEventListener('click', (e) => {
   } else if (action === 'logout') {
     S.tab = 'today';
     signOut(auth);
-  } else if (action === 'checkin') {
+  } else if (action === 'confirm-checkin') {
+    if (!S.preview) return;
     withBusy(async () => {
       const now = kst();
       const today = keyOf(now);
-      await setDoc(doc(db, 'checkins', `${S.user.uid}_${today}`), {
+      const id = `${S.user.uid}_${today}`;
+      const batch = writeBatch(db);
+      batch.set(doc(db, 'checkins', id), {
         uid: S.user.uid, day: today, ym: ymOf(now),
         goalMin: effectiveGoal(S.profile, today), at: serverTimestamp()
       });
+      batch.set(doc(db, 'photos', id), { uid: S.user.uid, day: today, img: S.preview });
+      await batch.commit();
+      S.preview = null;
       toast('기상 인증 완료! 오늘도 멋진 하루 보내세요');
     });
+  } else if (action === 'view-photo') {
+    S.viewPhoto = el.dataset.id; render();
+  } else if (action === 'close-photo') {
+    S.viewPhoto = null; render();
   }
 });
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && S.viewPhoto) { S.viewPhoto = null; render(); }
+  // 사진 찍기 라벨을 키보드(Enter/Space)로도 열 수 있게
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches && e.target.matches('label[for="cam"]')) {
+    e.preventDefault();
+    const cam = document.getElementById('cam');
+    if (cam) cam.click();
+  }
+});
+
+// 사진 고르기 → 작게 줄여서 미리보기
+document.addEventListener('change', async (e) => {
+  const input = e.target;
+  if (!input.matches || !input.matches('[data-action-change="photo"]')) return;
+  const file = input.files && input.files[0];
+  input.blur();
+  if (!file) return;
+  if (!file.type.startsWith('image/')) return toast('사진 파일만 올릴 수 있어요.');
+  try {
+    S.preview = await shrinkImage(file);
+    render();
+  } catch (err) {
+    console.error(err);
+    toast('사진을 불러오지 못했어요. 다시 찍어 주세요.');
+  }
+});
+
+function shrinkImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, PHOTO_MAX / Math.max(img.naturalWidth, img.naturalHeight));
+      const w = Math.round(img.naturalWidth * scale), h = Math.round(img.naturalHeight * scale);
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      URL.revokeObjectURL(url);
+      let q = 0.7, data = canvas.toDataURL('image/jpeg', q);
+      while (data.length > 300000 && q > 0.3) { q -= 0.1; data = canvas.toDataURL('image/jpeg', q); }
+      if (data.length > 450000) return reject(new Error('too big'));
+      resolve(data);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('load failed')); };
+    img.src = url;
+  });
+}
 
 document.addEventListener('submit', (e) => {
   const form = e.target.closest('[data-form]');
@@ -527,7 +645,7 @@ document.addEventListener('submit', (e) => {
 // 시간이 흐르면 화면(인증 가능 여부 등)을 갱신
 setInterval(() => {
   if (S.user && S.profile) {
-    if (ymOf(kst()) !== ym0 && S.user) { stopListening(); startListening(S.user.uid); }
+    if (keyOf(kst()) !== day0 && S.user) { S.preview = null; stopListening(); startListening(S.user.uid); }
     render();
   }
 }, 30000);
