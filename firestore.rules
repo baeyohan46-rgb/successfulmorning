@@ -1,0 +1,95 @@
+rules_version = '2';
+
+// 기상 챌린지 보안 규칙
+// - 인증 시각은 서버 시간(request.time)으로만 기록 → 폰 시계를 바꿔도 소용없음
+// - 인증 가능 시간: 목표 시간 90분 전 ~ 30분 후 (서버가 검사)
+// - 하루 한 번만, 수정 불가
+// - 목표 시간 변경은 다음 날부터 적용 (당일 꼼수 방지)
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAdmin() {
+      return signedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    // 한국 시간
+    function kst() { return request.time + duration.value(9, 'h'); }
+    function dayKey(t) { return t.year() * 10000 + t.month() * 100 + t.day(); }
+    function todayKey() { return dayKey(kst()); }
+    function tomorrowKey() { return dayKey(request.time + duration.value(33, 'h')); }
+    function nowMinutes() { return kst().hours() * 60 + kst().minutes(); }
+
+    function validGoal(g) { return g is int && g >= 240 && g <= 660; }      // 04:00 ~ 11:00
+    function validName(n) { return n is string && n.size() >= 1 && n.size() <= 12; }
+
+    // 오늘 적용되는 목표 시간이 g 인지
+    function goalIs(u, g) {
+      return (todayKey() >= u.nextFrom && g == u.nextGoalMin)
+          || (todayKey() < u.nextFrom && g == u.goalMin);
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn();
+
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['nickname', 'goalMin', 'nextGoalMin', 'nextFrom', 'joinedAt'])
+        && validName(request.resource.data.nickname)
+        && validGoal(request.resource.data.goalMin)
+        && request.resource.data.nextGoalMin == request.resource.data.goalMin
+        && request.resource.data.nextFrom == 0
+        && request.resource.data.joinedAt == request.time;
+
+      allow update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['nickname', 'goalMin', 'nextGoalMin', 'nextFrom', 'joinedAt'])
+        && request.resource.data.joinedAt == resource.data.joinedAt
+        && validName(request.resource.data.nickname)
+        && validGoal(request.resource.data.nextGoalMin)
+        && (
+          // 닉네임만 변경
+          (request.resource.data.goalMin == resource.data.goalMin
+            && request.resource.data.nextGoalMin == resource.data.nextGoalMin
+            && request.resource.data.nextFrom == resource.data.nextFrom)
+          ||
+          // 목표 시간 변경 → 내일부터 적용
+          (goalIs(resource.data, request.resource.data.goalMin)
+            && request.resource.data.nextFrom == tomorrowKey())
+        );
+
+      allow delete: if isAdmin();
+    }
+
+    match /checkins/{id} {
+      allow read: if signedIn();
+
+      allow create: if signedIn()
+        && id == request.auth.uid + '_' + string(todayKey())
+        && request.resource.data.keys().hasOnly(['uid', 'day', 'ym', 'goalMin', 'at'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.day == todayKey()
+        && request.resource.data.ym == kst().year() * 100 + kst().month()
+        && request.resource.data.at == request.time
+        && goalIs(get(/databases/$(database)/documents/users/$(request.auth.uid)).data, request.resource.data.goalMin)
+        && nowMinutes() >= request.resource.data.goalMin - 90
+        && nowMinutes() <= request.resource.data.goalMin + 30;
+
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
+    // 월별 상품 (관리자만 수정)
+    match /prizes/{ym} {
+      allow read: if signedIn();
+      allow write: if isAdmin()
+        && request.resource.data.keys().hasOnly(['text'])
+        && request.resource.data.text is string
+        && request.resource.data.text.size() <= 60;
+    }
+
+    // 관리자 목록 (Firebase 콘솔에서 직접 추가)
+    match /admins/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow write: if false;
+    }
+  }
+}
